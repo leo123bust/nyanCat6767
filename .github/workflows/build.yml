@@ -1,0 +1,166 @@
+name: Build NyanCat6767 APK
+
+# Put this file in your repository as  .github/workflows/build.yml
+# and upload NyanCat6767_Project.zip to the repository root (the workflow extracts it by itself).
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      flutter_version:
+        description: "Optional exact Flutter version (leave empty for the latest stable), e.g. 3.41.5"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nyancat-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-apk:
+    name: Build release APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: 1. Download the repository
+        uses: actions/checkout@v4
+
+      - name: 2. Extract NyanCat6767_Project.zip and locate the Flutter project root
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$GITHUB_WORKSPACE/_project"
+          rm -rf "$WORK"
+          mkdir -p "$WORK"
+          ZIP="$(find "$GITHUB_WORKSPACE" -maxdepth 4 -type f -iname 'NyanCat6767_Project.zip' -not -path '*/_project/*' | head -n 1)"
+          if [ -n "$ZIP" ]; then
+            echo "Found ZIP: $ZIP"
+            unzip -q -o "$ZIP" -d "$WORK" || python3 -m zipfile -e "$ZIP" "$WORK"
+            SEARCH="$WORK"
+          else
+            echo "No ZIP found - looking for an already extracted Flutter project inside the repository"
+            SEARCH="$GITHUB_WORKSPACE"
+          fi
+          ROOT=""
+          while IFS= read -r f; do
+            if grep -q 'sdk: *flutter' "$f"; then
+              ROOT="$(dirname "$f")"
+              break
+            fi
+          done < <(find "$SEARCH" -type f -name pubspec.yaml -not -path '*/.*' -not -path '*/build/*' | awk '{ print length($0) " " $0 }' | sort -n | cut -d' ' -f2-)
+          if [ -z "$ROOT" ]; then
+            echo "::error::Flutter project root (a pubspec.yaml that uses Flutter) was not found. Upload NyanCat6767_Project.zip to the repository root."
+            exit 1
+          fi
+          echo "Flutter project root: $ROOT"
+          echo "PROJECT_DIR=$ROOT" >> "$GITHUB_ENV"
+          ls -la "$ROOT"
+
+      - name: 3. Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: 4. Install Flutter (stable)
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ github.event.inputs.flutter_version }}
+          cache: true
+
+      - name: Flutter version
+        shell: bash
+        run: |
+          flutter --version
+          flutter config --no-analytics || true
+
+      - name: Refresh Android Gradle files from the installed Flutter template (keeps minSdk 31)
+        shell: bash
+        run: |
+          set -euo pipefail
+          A="$PROJECT_DIR/android"
+          S="$RUNNER_TEMP/nyan_scaffold"
+          rm -rf "$S"
+          if (cd "$RUNNER_TEMP" && flutter create --platforms=android --org com.nyancat6767 --project-name nyancat6767 --no-pub "$S" > "$RUNNER_TEMP/flutter_create.log" 2>&1) && [ -d "$S/android" ]; then
+            echo "Scaffold created with the installed Flutter template - refreshing Gradle build files."
+            FILES="settings.gradle settings.gradle.kts build.gradle build.gradle.kts gradle.properties app/build.gradle app/build.gradle.kts gradle/wrapper/gradle-wrapper.properties"
+            for f in $FILES; do rm -f "$A/$f"; done
+            for f in $FILES gradle/wrapper/gradle-wrapper.jar gradlew gradlew.bat; do
+              if [ -f "$S/android/$f" ]; then
+                mkdir -p "$(dirname "$A/$f")"
+                cp -f "$S/android/$f" "$A/$f"
+              fi
+            done
+            chmod +x "$A/gradlew" 2>/dev/null || true
+          else
+            echo "::warning::flutter create failed - keeping the Gradle files that are shipped inside the project"
+            cat "$RUNNER_TEMP/flutter_create.log" || true
+          fi
+          # Minimum SDK 31 (Android 12+)
+          for f in "$A/app/build.gradle.kts" "$A/app/build.gradle"; do
+            if [ -f "$f" ]; then
+              if grep -Eq '^[[:space:]]*minSdk(Version)?[[:space:]]*(=|[[:space:]])' "$f"; then
+                sed -i -E 's/^([[:space:]]*)minSdk(Version)?[[:space:]]*=?[[:space:]]*[^[:space:]].*$/\1minSdk = 31/' "$f"
+              else
+                sed -i -E '0,/defaultConfig[[:space:]]*\{/s//defaultConfig {\n        minSdk = 31/' "$f"
+              fi
+              echo "--- minSdk / targetSdk lines in $f"
+              grep -nE 'minSdk|targetSdk|compileSdk|namespace|applicationId' "$f" || true
+            fi
+          done
+          echo "--- Gradle plugin versions"
+          grep -nE 'com.android.application|org.jetbrains.kotlin' "$A"/settings.gradle* 2>/dev/null || true
+          cat "$A/gradle/wrapper/gradle-wrapper.properties" 2>/dev/null | grep distributionUrl || true
+
+      - name: 5. Install dependencies (flutter pub get)
+        shell: bash
+        run: |
+          cd "$PROJECT_DIR"
+          flutter pub get
+
+      - name: 6. Analyze (flutter analyze)
+        shell: bash
+        run: |
+          cd "$PROJECT_DIR"
+          flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      - name: Unit tests (informational)
+        shell: bash
+        continue-on-error: true
+        run: |
+          cd "$PROJECT_DIR"
+          flutter test
+
+      - name: 7. Build release APK
+        shell: bash
+        run: |
+          cd "$PROJECT_DIR"
+          flutter build apk --release --no-tree-shake-icons
+
+      - name: APK info (informational)
+        shell: bash
+        continue-on-error: true
+        run: |
+          APK="$PROJECT_DIR/build/app/outputs/flutter-apk/app-release.apk"
+          ls -lh "$APK"
+          AAPT2="$(find "${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}/build-tools" -name aapt2 | sort | tail -n 1)"
+          "$AAPT2" dump badging "$APK" | grep -E "^package:|^sdkVersion|^targetSdkVersion|^application-label:" || true
+
+      - name: Collect APK
+        shell: bash
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/artifact"
+          cp "$PROJECT_DIR/build/app/outputs/flutter-apk/app-release.apk" "$GITHUB_WORKSPACE/artifact/NyanCat6767.apk"
+
+      - name: 8. Upload the APK as a downloadable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NyanCat6767-release-apk
+          path: artifact/NyanCat6767.apk
+          if-no-files-found: error
